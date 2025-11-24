@@ -33,7 +33,9 @@ class Trainer(pl.LightningModule):
         warmup_epochs: int = 10,
         epochs: int = 60,
         weight_decay: float = 1e-4,
-        decoder: str = "detr"
+        decoder: str = "detr",
+        dt: float = 0.1,
+        kinematic_loss_weight: float = 1.0,
     ) -> None:
         super(Trainer, self).__init__()
         self.warmup_epochs = warmup_epochs
@@ -44,6 +46,8 @@ class Trainer(pl.LightningModule):
 
         self.history_steps = historical_steps
         self.future_steps = future_steps
+        self.dt = dt
+        self.kinematic_loss_weight = kinematic_loss_weight
         self.submission_handler = SubmissionAv2()
 
         self.net = EMP(
@@ -109,16 +113,43 @@ class Trainer(pl.LightningModule):
 
         agent_cls_loss = F.cross_entropy(pi, best_mode.detach())
         loss += agent_reg_loss + agent_cls_loss
-        
+
         others_reg_mask = ~data["x_padding_mask"][:, 1:, self.history_steps:]
         others_reg_loss = F.smooth_l1_loss(y_hat_others[others_reg_mask], y_others[others_reg_mask])
         loss += others_reg_loss
-    
+
+        future_mask = ~data["x_padding_mask"][:, 0, self.history_steps:]
+        pos = y_hat_best[..., :2]
+        pos_diff = pos[:, 1:] - pos[:, :-1]
+        valid_pairs = future_mask[:, 1:] & future_mask[:, :-1]
+        velocities = torch.zeros_like(pos_diff)
+        velocities[valid_pairs] = pos_diff[valid_pairs] / self.dt
+
+        heading = torch.atan2(velocities[..., 1], velocities[..., 0])
+        speed = torch.norm(velocities, dim=-1)
+        direction = torch.stack((torch.cos(heading), torch.sin(heading)), dim=-1)
+
+        predicted_next = pos[:, 1:-1] + (speed[:, :-1] * self.dt).unsqueeze(-1) * direction[:, :-1]
+        kinematic_targets = pos[:, 2:]
+        valid_triplets = (
+            future_mask[:, :-2] & future_mask[:, 1:-1] & future_mask[:, 2:]
+        )
+
+        if valid_triplets.any():
+            kinematic_loss = F.smooth_l1_loss(
+                predicted_next[valid_triplets], kinematic_targets[valid_triplets]
+            )
+        else:
+            kinematic_loss = torch.tensor(0.0, device=pos.device, dtype=pos.dtype)
+
+        loss += self.kinematic_loss_weight * kinematic_loss
+
         return {
             "loss": loss,
             "reg_loss": agent_reg_loss.item(),
             "cls_loss": agent_cls_loss.item(),
             "others_reg_loss": others_reg_loss.item(),
+            "kinematic_loss": kinematic_loss.item(),
         }
 
     def training_step(self, data, batch_idx):
