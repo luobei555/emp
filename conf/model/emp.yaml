@@ -17,3 +17,5 @@ target:
   epochs: ${epochs}
   warmup_epochs: ${warmup_epochs}
   decoder: mlp
+  dt: 0.1
+  kinematic_loss_weight: 1.0
